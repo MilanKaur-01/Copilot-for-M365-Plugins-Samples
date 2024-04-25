@@ -5,6 +5,7 @@ import {
 import { TableClient, TableEntityResult } from "@azure/data-tables";
 import config from "../config";
 import { getInventoryStatus } from '../adaptiveCards/utils';
+import DbService, { DbProject } from './dbService';
 
 // NOTE: We're force fitting a relational database into a non-relational database so please
 // forgive the inefficiencies. This is just for demonstration purposes.
@@ -194,13 +195,18 @@ async function getAllProductsEx(): Promise<ProductEx[]> {
 
     for await (const entity of entities) {
         const p = getProductExForEntity(entity);
-        result.push(p);
+        result.push(await p);
     }
     return result;
 }
+export async function getCategories(): Promise<ReferenceData<Category>>{
+    return  await loadReferenceData<Category>(TABLE_NAME.CATEGORY);
+}
+export async function getSuppliers(): Promise<ReferenceData<Supplier>>{
+    return  await loadReferenceData<Supplier>(TABLE_NAME.SUPPLIER);
+}
 
-function getProductExForEntity(entity: TableEntityResult<Record<string, unknown>>): ProductEx {
-
+async function getProductExForEntity(entity: TableEntityResult<Record<string, unknown>>): Promise<ProductEx> {
     let result: ProductEx = {
         etag: entity.etag as string,
         partitionKey: entity.partitionKey as string,
@@ -226,21 +232,26 @@ function getProductExForEntity(entity: TableEntityResult<Record<string, unknown>
         Revenue: 0,
         AverageDiscount: 0
     };
-
+    // Ensure reference data are loaded
+    categories = categories ?? await loadReferenceData<Category>(TABLE_NAME.CATEGORY);
+    suppliers = suppliers ?? await loadReferenceData<Supplier>(TABLE_NAME.SUPPLIER);
+    orderTotals = orderTotals ?? await loadOrderTotals();
     // Fill in extended properties
     result.CategoryName = categories[result.CategoryID].CategoryName;
     result.SupplierName = suppliers[result.SupplierID].CompanyName;
     result.SupplierCity = suppliers[result.SupplierID].City;
-    result.UnitSales =  orderTotals[result.ProductID].totalQuantity;
+    result.UnitSales = orderTotals && orderTotals[result.ProductID] ? orderTotals[result.ProductID].totalQuantity : 0;
     result.InventoryValue = Math.round(result.UnitsInStock * result.UnitPrice);
-    result.Revenue = Math.round(orderTotals[result.ProductID].totalRevenue);
-    result.AverageDiscount = +(result.Revenue / orderTotals[result.ProductID].totalDiscount).toFixed(1);
+    result.Revenue = orderTotals && orderTotals[result.ProductID] ? Math.round(orderTotals[result.ProductID].totalRevenue) : 0;
+    result.AverageDiscount = orderTotals && orderTotals[result.ProductID] ? +(result.Revenue / orderTotals[result.ProductID].totalDiscount).toFixed(1) : 0;
+
 
     // 'in stock', 'low stock', 'on order', or 'out of stock'
     result.InventoryStatus = getInventoryStatus(result);          
 
     return result;
 }
+
 
 export async function getProductEx(productId: number): Promise<ProductEx> {
     const tableClient = TableClient.fromConnectionString(config.storageAccountConnectionString, TABLE_NAME.PRODUCT);
@@ -261,18 +272,32 @@ export async function updateProduct(updatedProduct: Product): Promise<void> {
 
 // #endregion
 
+export async function createProduct (product: Product): Promise<string> {
+    // NOTE: Assignments are READ-WRITE so disable local caching
+    const dbService = new DbService<DbProject>(false);
+    const nextId= await dbService.getNextId(TABLE_NAME.PRODUCT);
+    const newProduct: DbProject = {
+        etag: "",
+        partitionKey: TABLE_NAME.PRODUCT,
+        rowKey: nextId.toString(),
+        timestamp: new Date(),
+        ProductID:nextId.toString(), 
+        ProductName: product.ProductName,
+        SupplierID: product.SupplierID,
+        CategoryID: product.CategoryID,
+        QuantityPerUnit: product.QuantityPerUnit,
+        UnitPrice: product.UnitPrice,
+        UnitsInStock: product.UnitsInStock,
+        UnitsOnOrder: product.UnitsOnOrder,
+        ReorderLevel: product.ReorderLevel,
+        Discontinued: product.Discontinued,
+        ImageUrl: "https://picsum.photos/seed/1/200/300"
+    };
+    await dbService.createEntity(TABLE_NAME.PRODUCT, newProduct.ProductID, newProduct);
+    return newProduct.ProductID;
+};
+
 // #region -- NOT USED, NOT TESTED ---------------------------------------------------------
-
-// export async function createProduct (product: Product): Promise<void> {
-//     const newProduct: Product = {
-//         partitionKey: TABLE_NAME.PRODUCT,
-//         rowKey: product.ProductID,
-//         ...product,
-//     }
-//     const tableClient = TableClient.fromConnectionString(config.storageAccountConnectionString, TABLE_NAME.PRODUCT);
-//     await tableClient.createEntity(newProduct);
-// };
-
 // export async function deleteProduct (productId: number): Promise<void> {
 //     const tableClient = TableClient.fromConnectionString(config.storageAccountConnectionString, TABLE_NAME.PRODUCT);
 //     await tableClient.deleteEntity(TABLE_NAME.PRODUCT, productId.toString());
